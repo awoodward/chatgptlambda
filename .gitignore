@@ -1,0 +1,15 @@
+# Ignore config file
+config.yaml
+# Ignore Google Credentials File
+credentials.json
+*.json
+.env
+# Ignore Go build artifacts
+*.exe
+*.test
+*.out
+*.zip
+bootstrap
+# Ignore Go module files
+go.sum
+__debug_bin*

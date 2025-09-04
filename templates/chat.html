@@ -1,0 +1,190 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Chat</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .chat-container {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .chat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        .chat-header h1 {
+            margin: 0;
+            font-size: 1.5em;
+        }
+        .clear-button {
+            padding: 8px 16px;
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .clear-button:hover {
+            background-color: #c82333;
+        }
+        .chat-messages {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+            background-color: #fafafa;
+        }
+        .message {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 8px;
+            max-width: 70%;
+            word-wrap: break-word;
+        }
+        .user-message {
+            background-color: #007bff;
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+        .bot-message {
+            background-color: #e9ecef;
+            color: #333;
+            margin-right: auto;
+        }
+        .timestamp {
+            font-size: 0.8em;
+            opacity: 0.7;
+            margin-top: 5px;
+        }
+        .input-form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        #messageInput {
+            width: 100%;
+            height: 80px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+            font-family: inherit;
+            box-sizing: border-box;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            align-self: flex-end;
+        }
+        #sendButton {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        #sendButton:hover {
+            background-color: #0056b3;
+        }
+        #sendButton:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .empty-chat {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+            padding: 40px 20px;
+        }
+        .session-info {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+            color: #666;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h1>Chat with ChatGPT Agent</h1>
+            <form method="POST" action="/clear" style="margin: 0;" onsubmit="return confirm('Are you sure you want to clear this chat session?')">
+                <button type="submit" class="clear-button">Clear Session</button>
+            </form>
+        </div>
+        
+        <div class="session-info">
+            {{if .Messages}}
+                Session active • {{len .Messages}} messages
+            {{else}}
+                New session started • Start chatting below
+            {{end}}
+        </div>
+        
+        <div class="chat-messages" id="chatMessages">
+            {{if .Messages}}
+                {{range .Messages}}
+                    <div class="message {{if .IsUser}}user-message{{else}}bot-message{{end}}">
+                        <div>{{.Content}}</div>
+                        <div class="timestamp">{{.Timestamp.Format "15:04:05"}}</div>
+                    </div>
+                {{end}}
+            {{else}}
+                <div class="empty-chat">
+                    👋 Welcome! Start a conversation by typing a message below.
+                </div>
+            {{end}}
+        </div>
+        
+        <form class="input-form" method="POST" action="/send">
+            <textarea id="messageInput" name="message" placeholder="Type your message here..." required></textarea>
+            <div class="button-group">
+                <button type="submit" id="sendButton">Send Message</button>
+            </div>
+        </form>
+    </div>
+
+    <script>
+        function scrollToBottom() {
+            const chatMessages = document.getElementById('chatMessages');
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        window.addEventListener('load', function() {
+            scrollToBottom();
+            document.getElementById('messageInput').focus();
+        });
+
+        document.getElementById('messageInput').addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                document.querySelector('.input-form').submit();
+            }
+        });
+    </script>
+</body>
+</html>
