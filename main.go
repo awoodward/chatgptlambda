@@ -71,11 +71,18 @@ type OpenAIChoice struct {
 type OpenAIResponse struct {
 	Choices []OpenAIChoice `json:"choices"`
 	Error   *OpenAIError   `json:"error,omitempty"`
+	Usage   *OpenAIUsage   `json:"usage,omitempty"`
 }
 
 type OpenAIError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
+}
+
+type OpenAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 var (
@@ -218,6 +225,7 @@ func getOrCreateSession(ctx context.Context, sessionID string) (*ChatSession, er
 
 // callOpenAI sends a message to OpenAI ChatGPT API with function calling support
 func callOpenAI(ctx context.Context, messages []Message) (string, error) {
+	log.Println("Calling OpenAI API...")
 	// Convert our messages to OpenAI format
 	openaiMessages := make([]OpenAIMessage, 0)
 
@@ -231,23 +239,32 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 		Content: systemMessage,
 	})
 
-	// Add conversation history
+	// Add conversation history with validation
 	for _, msg := range messages {
 		role := "assistant"
 		if msg.IsUser {
 			role = "user"
 		}
+
+		// Ensure content is never empty or null
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			log.Printf("Warning: Empty content found in message, skipping")
+			continue // Skip messages with empty content
+		}
+
 		openaiMessages = append(openaiMessages, OpenAIMessage{
 			Role:    role,
-			Content: msg.Content,
+			Content: content,
 		})
 	}
 
 	// Get model from environment variable
 	model := os.Getenv("OPENAI_MODEL")
 	if model == "" {
-		model = "gpt-4o-mini" // Default model
+		model = "gpt-4.1-mini" // Default model
 	}
+	log.Printf("Using model: %s", model)
 
 	// Prepare tools
 	tools := make([]OpenAITool, 0)
@@ -272,22 +289,56 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 		reqBody.ToolChoice = "auto"
 	}
 
-	// Make initial request
-	response, err := makeOpenAIRequest(ctx, reqBody)
-	if err != nil {
-		return "", err
+	log.Printf("Requesting with %d messages and %d tools", len(openaiMessages), len(tools))
+
+	// Debug: Log the messages being sent (remove this after debugging)
+	for i, msg := range openaiMessages {
+		log.Printf("Message %d: role=%s, content_length=%d, content_empty=%v",
+			i, msg.Role, len(msg.Content), msg.Content == "")
 	}
 
-	if len(response.Choices) == 0 {
-		return "I'm sorry, I didn't receive a response from the API.", nil
-	}
+	// Loop to handle multiple rounds of tool calls
+	maxIterations := 5 // Prevent infinite loops
+	totalInputTokens := 0
+	totalOutputTokens := 0
 
-	choice := response.Choices[0]
+	for iteration := 0; iteration < maxIterations; iteration++ {
+		// Make request
+		response, err := makeOpenAIRequest(ctx, reqBody)
+		if err != nil {
+			return "", err
+		}
 
-	// Handle function calls
-	if choice.FinishReason == "tool_calls" && len(choice.Message.ToolCalls) > 0 {
-		// Add the assistant's message with tool calls
-		openaiMessages = append(openaiMessages, choice.Message)
+		// Log token usage
+		if response.Usage != nil {
+			totalInputTokens += response.Usage.PromptTokens
+			totalOutputTokens += response.Usage.CompletionTokens
+			log.Printf("Request %d - Input tokens: %d, Output tokens: %d, Total: %d",
+				iteration+1, response.Usage.PromptTokens, response.Usage.CompletionTokens, response.Usage.TotalTokens)
+		}
+
+		if len(response.Choices) == 0 {
+			log.Println("No response choices received from API.")
+			return "I'm sorry, I didn't receive a response from the API.", nil
+		}
+
+		choice := response.Choices[0]
+
+		// If no tool calls, we're done
+		if choice.FinishReason != "tool_calls" || len(choice.Message.ToolCalls) == 0 {
+			log.Printf("Final response - Total input tokens: %d, Total output tokens: %d, Grand total: %d",
+				totalInputTokens, totalOutputTokens, totalInputTokens+totalOutputTokens)
+			log.Printf("Received final response length: %d with finish reason: %s", len(choice.Message.Content), choice.FinishReason)
+			return choice.Message.Content, nil
+		}
+
+		// Handle function calls
+		log.Printf("Function calls detected: %d (iteration %d)", len(choice.Message.ToolCalls), iteration+1)
+		assistantMsg := choice.Message
+		if assistantMsg.Content == "" {
+			assistantMsg.Content = "" // Explicitly set empty string instead of null
+		}
+		openaiMessages = append(openaiMessages, assistantMsg)
 
 		// Execute each tool call
 		for _, toolCall := range choice.Message.ToolCalls {
@@ -307,21 +358,14 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 			})
 		}
 
-		// Make follow-up request with function results
+		log.Printf("Making follow-up request with %d messages (iteration %d)", len(openaiMessages), iteration+1)
+		// Update request body for next iteration
 		reqBody.Messages = openaiMessages
-		response, err = makeOpenAIRequest(ctx, reqBody)
-		if err != nil {
-			return "", err
-		}
-
-		if len(response.Choices) == 0 {
-			return "I'm sorry, I didn't receive a response from the API.", nil
-		}
-
-		return response.Choices[0].Message.Content, nil
 	}
 
-	return choice.Message.Content, nil
+	// If we exit the loop without getting a final response
+	log.Printf("Maximum iterations reached - Total input tokens: %d, Total output tokens: %d", totalInputTokens, totalOutputTokens)
+	return "I apologize, but I encountered an issue processing your request after multiple attempts.", nil
 }
 
 // makeOpenAIRequest makes an HTTP request to OpenAI API
