@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -20,7 +21,7 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dynamoTypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -61,17 +62,33 @@ type OpenAIRequest struct {
 	ToolChoice  string          `json:"tool_choice,omitempty"`
 	MaxTokens   int             `json:"max_tokens,omitempty"`
 	Temperature float64         `json:"temperature,omitempty"`
+	Stream      bool            `json:"stream,omitempty"`
 }
 
 type OpenAIChoice struct {
 	Message      OpenAIMessage `json:"message"`
 	FinishReason string        `json:"finish_reason"`
+	Delta        *OpenAIDelta  `json:"delta,omitempty"`
+}
+
+type OpenAIDelta struct {
+	Content   string     `json:"content,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role      string     `json:"role,omitempty"`
 }
 
 type OpenAIResponse struct {
 	Choices []OpenAIChoice `json:"choices"`
 	Error   *OpenAIError   `json:"error,omitempty"`
 	Usage   *OpenAIUsage   `json:"usage,omitempty"`
+}
+
+type OpenAIStreamResponse struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []OpenAIChoice `json:"choices"`
 }
 
 type OpenAIError struct {
@@ -83,6 +100,13 @@ type OpenAIUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+}
+
+// Streaming response data structures
+type StreamData struct {
+	Content string `json:"content,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Done    bool   `json:"done,omitempty"`
 }
 
 var (
@@ -107,7 +131,7 @@ func init() {
 	}
 
 	// Initialize AWS clients
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	cfg, err := awsconfig.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Fatal("Error loading AWS config:", err)
 	}
@@ -223,13 +247,14 @@ func getOrCreateSession(ctx context.Context, sessionID string) (*ChatSession, er
 	return session, nil
 }
 
-// callOpenAI sends a message to OpenAI ChatGPT API with function calling support
-func callOpenAI(ctx context.Context, messages []Message) (string, error) {
-	log.Println("Calling OpenAI API...")
+// Fixed streamOpenAIResponse function with proper tool call handling
+func streamOpenAIResponse(ctx context.Context, messages []Message, writer io.Writer, session *ChatSession) error {
+	log.Println("Starting streaming OpenAI API call...")
+
 	// Convert our messages to OpenAI format
 	openaiMessages := make([]OpenAIMessage, 0)
 
-	// Add system message (optional - you can customize this)
+	// Add system message
 	systemMessage := os.Getenv("SYSTEM_MESSAGE")
 	if systemMessage == "" {
 		systemMessage = "You are a helpful assistant with access to various tools and functions."
@@ -246,11 +271,10 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 			role = "user"
 		}
 
-		// Ensure content is never empty or null
 		content := strings.TrimSpace(msg.Content)
 		if content == "" {
 			log.Printf("Warning: Empty content found in message, skipping")
-			continue // Skip messages with empty content
+			continue
 		}
 
 		openaiMessages = append(openaiMessages, OpenAIMessage{
@@ -262,9 +286,279 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 	// Get model from environment variable
 	model := os.Getenv("OPENAI_MODEL")
 	if model == "" {
-		model = "gpt-4.1-mini" // Default model
+		model = "gpt-4o-mini" // Default model
 	}
-	log.Printf("Using model: %s", model)
+
+	// Prepare tools
+	tools := make([]OpenAITool, 0)
+	schemas := functionRegistry.GetSchemas()
+	for _, schema := range schemas {
+		tools = append(tools, OpenAITool{
+			Type:     "function",
+			Function: schema,
+		})
+	}
+
+	// For streaming with function calls, we need to handle this differently
+	// OpenAI streaming with function calls is complex, so let's fall back to non-streaming for function calls
+	if len(tools) > 0 {
+		log.Println("Tools detected, using non-streaming mode for function calls")
+		return streamNonStreamingResponse(ctx, openaiMessages, tools, model, writer, session)
+	}
+
+	// Continue with regular streaming for simple responses
+	return streamRegularResponse(ctx, openaiMessages, model, writer, session)
+}
+
+// Handle non-streaming responses but send them as a stream
+func streamNonStreamingResponse(ctx context.Context, openaiMessages []OpenAIMessage, tools []OpenAITool, model string, writer io.Writer, session *ChatSession) error {
+	// Prepare request for non-streaming
+	reqBody := OpenAIRequest{
+		Model:       model,
+		Messages:    openaiMessages,
+		MaxTokens:   2000,
+		Temperature: 0.7,
+		Stream:      false, // Important: disable streaming for function calls
+	}
+
+	// Add tools
+	reqBody.Tools = tools
+	reqBody.ToolChoice = "auto"
+
+	// Handle multiple rounds of tool calls
+	maxIterations := 5
+	totalResponse := ""
+
+	for iteration := 0; iteration < maxIterations; iteration++ {
+		response, err := makeOpenAIRequest(ctx, reqBody)
+		if err != nil {
+			errorData := StreamData{Error: err.Error()}
+			jsonData, _ := json.Marshal(errorData)
+			fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+			return err
+		}
+
+		if len(response.Choices) == 0 {
+			errorData := StreamData{Error: "No response from API"}
+			jsonData, _ := json.Marshal(errorData)
+			fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+			return fmt.Errorf("no response from API")
+		}
+
+		choice := response.Choices[0]
+
+		// If no tool calls, we're done
+		if choice.FinishReason != "tool_calls" || len(choice.Message.ToolCalls) == 0 {
+			// Stream the final response
+			if choice.Message.Content != "" {
+				totalResponse += choice.Message.Content
+				// Send it as chunks to simulate streaming
+				words := strings.Fields(choice.Message.Content)
+				for _, word := range words {
+					streamData := StreamData{Content: word + " "}
+					jsonData, _ := json.Marshal(streamData)
+					fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+					time.Sleep(50 * time.Millisecond) // Small delay to simulate streaming
+				}
+			}
+
+			// Save to session
+			if totalResponse != "" {
+				session.Messages = append(session.Messages, Message{
+					Content:   totalResponse,
+					IsUser:    false,
+					Timestamp: time.Now(),
+				})
+				saveSessionToDynamoDB(ctx, session)
+			}
+
+			return nil
+		}
+
+		// Handle function calls
+		log.Printf("Function calls detected: %d (iteration %d)", len(choice.Message.ToolCalls), iteration+1)
+
+		// Add assistant message with tool calls
+		assistantMsg := choice.Message
+		if assistantMsg.Content == "" {
+			assistantMsg.Content = ""
+		}
+		openaiMessages = append(openaiMessages, assistantMsg)
+
+		// Execute each tool call and stream the results
+		for _, toolCall := range choice.Message.ToolCalls {
+			log.Printf("Executing function: %s with args: %s", toolCall.Function.Name, toolCall.Function.Arguments)
+
+			result, err := executeFunctionCall(ctx, toolCall)
+			if err != nil {
+				log.Printf("Function execution error: %v", err)
+				result = fmt.Sprintf("Error executing function: %v", err)
+			}
+
+			// Stream the function result
+			//functionResult := fmt.Sprintf("\n[Function %s]: %s\n", toolCall.Function.Name, result)
+			functionResult := fmt.Sprintf("\n[Calling Function: %s]\n", toolCall.Function.Name)
+			totalResponse += functionResult
+
+			streamData := StreamData{Content: functionResult}
+			jsonData, _ := json.Marshal(streamData)
+			fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+
+			// Add function result message
+			openaiMessages = append(openaiMessages, OpenAIMessage{
+				Role:       "tool",
+				Content:    result,
+				ToolCallID: toolCall.ID,
+			})
+		}
+
+		// Update request for next iteration
+		reqBody.Messages = openaiMessages
+	}
+
+	// Save final response to session
+	if totalResponse != "" {
+		session.Messages = append(session.Messages, Message{
+			Content:   totalResponse,
+			IsUser:    false,
+			Timestamp: time.Now(),
+		})
+		saveSessionToDynamoDB(ctx, session)
+	}
+
+	return nil
+}
+
+// Handle regular streaming responses (no function calls)
+func streamRegularResponse(ctx context.Context, openaiMessages []OpenAIMessage, model string, writer io.Writer, session *ChatSession) error {
+	// Prepare request for streaming
+	reqBody := OpenAIRequest{
+		Model:       model,
+		Messages:    openaiMessages,
+		MaxTokens:   2000,
+		Temperature: 0.7,
+		Stream:      true,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("error marshaling request: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+openaiAPIKey)
+
+	// Make request
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("error making request to OpenAI: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var fullResponse strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			data := line[6:] // Remove "data: " prefix
+
+			if data == "[DONE]" {
+				break
+			}
+
+			var streamResponse OpenAIStreamResponse
+			if err := json.Unmarshal([]byte(data), &streamResponse); err != nil {
+				log.Printf("Error parsing stream response: %v", err)
+				continue
+			}
+
+			if len(streamResponse.Choices) > 0 {
+				choice := streamResponse.Choices[0]
+
+				if choice.Delta != nil && choice.Delta.Content != "" {
+					fullResponse.WriteString(choice.Delta.Content)
+
+					// Send chunk to client
+					streamData := StreamData{Content: choice.Delta.Content}
+					jsonData, _ := json.Marshal(streamData)
+					fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading stream: %w", err)
+	}
+
+	// Save complete response to session
+	if fullResponse.Len() > 0 {
+		session.Messages = append(session.Messages, Message{
+			Content:   fullResponse.String(),
+			IsUser:    false,
+			Timestamp: time.Now(),
+		})
+
+		if err := saveSessionToDynamoDB(ctx, session); err != nil {
+			log.Printf("Error saving session after streaming: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// callOpenAI sends a message to OpenAI ChatGPT API (non-streaming fallback)
+func callOpenAI(ctx context.Context, messages []Message) (string, error) {
+	log.Println("Calling OpenAI API (non-streaming)...")
+	// Convert our messages to OpenAI format
+	openaiMessages := make([]OpenAIMessage, 0)
+
+	// Add system message
+	systemMessage := os.Getenv("SYSTEM_MESSAGE")
+	if systemMessage == "" {
+		systemMessage = "You are a helpful assistant with access to various tools and functions."
+	}
+	openaiMessages = append(openaiMessages, OpenAIMessage{
+		Role:    "system",
+		Content: systemMessage,
+	})
+
+	// Add conversation history with validation
+	for _, msg := range messages {
+		role := "assistant"
+		if msg.IsUser {
+			role = "user"
+		}
+
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			log.Printf("Warning: Empty content found in message, skipping")
+			continue
+		}
+
+		openaiMessages = append(openaiMessages, OpenAIMessage{
+			Role:    role,
+			Content: content,
+		})
+	}
+
+	// Get model from environment variable
+	model := os.Getenv("OPENAI_MODEL")
+	if model == "" {
+		model = "gpt-4o-mini" // Default model
+	}
 
 	// Prepare tools
 	tools := make([]OpenAITool, 0)
@@ -281,6 +575,7 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 		Messages:    openaiMessages,
 		MaxTokens:   2000,
 		Temperature: 0.7,
+		Stream:      false,
 	}
 
 	// Add tools if any are available
@@ -289,68 +584,37 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 		reqBody.ToolChoice = "auto"
 	}
 
-	log.Printf("Requesting with %d messages and %d tools", len(openaiMessages), len(tools))
-
-	// Debug: Log the messages being sent (remove this after debugging)
-	for i, msg := range openaiMessages {
-		log.Printf("Message %d: role=%s, content_length=%d, content_empty=%v",
-			i, msg.Role, len(msg.Content), msg.Content == "")
-	}
-
-	// Loop to handle multiple rounds of tool calls
-	maxIterations := 5 // Prevent infinite loops
-	totalInputTokens := 0
-	totalOutputTokens := 0
-
+	// Handle multiple rounds of tool calls (existing logic)
+	maxIterations := 5
 	for iteration := 0; iteration < maxIterations; iteration++ {
-		// Make request
 		response, err := makeOpenAIRequest(ctx, reqBody)
 		if err != nil {
 			return "", err
 		}
 
-		// Log token usage
-		if response.Usage != nil {
-			totalInputTokens += response.Usage.PromptTokens
-			totalOutputTokens += response.Usage.CompletionTokens
-			log.Printf("Request %d - Input tokens: %d, Output tokens: %d, Total: %d",
-				iteration+1, response.Usage.PromptTokens, response.Usage.CompletionTokens, response.Usage.TotalTokens)
-		}
-
 		if len(response.Choices) == 0 {
-			log.Println("No response choices received from API.")
 			return "I'm sorry, I didn't receive a response from the API.", nil
 		}
 
 		choice := response.Choices[0]
 
-		// If no tool calls, we're done
 		if choice.FinishReason != "tool_calls" || len(choice.Message.ToolCalls) == 0 {
-			log.Printf("Final response - Total input tokens: %d, Total output tokens: %d, Grand total: %d",
-				totalInputTokens, totalOutputTokens, totalInputTokens+totalOutputTokens)
-			log.Printf("Received final response length: %d with finish reason: %s", len(choice.Message.Content), choice.FinishReason)
 			return choice.Message.Content, nil
 		}
 
 		// Handle function calls
-		log.Printf("Function calls detected: %d (iteration %d)", len(choice.Message.ToolCalls), iteration+1)
 		assistantMsg := choice.Message
 		if assistantMsg.Content == "" {
-			assistantMsg.Content = "" // Explicitly set empty string instead of null
+			assistantMsg.Content = ""
 		}
 		openaiMessages = append(openaiMessages, assistantMsg)
 
-		// Execute each tool call
 		for _, toolCall := range choice.Message.ToolCalls {
-			log.Printf("Executing function: %s with args: %s", toolCall.Function.Name, toolCall.Function.Arguments)
-
 			result, err := executeFunctionCall(ctx, toolCall)
 			if err != nil {
-				log.Printf("Function execution error: %v", err)
 				result = fmt.Sprintf("Error executing function: %v", err)
 			}
 
-			// Add function result message
 			openaiMessages = append(openaiMessages, OpenAIMessage{
 				Role:       "tool",
 				Content:    result,
@@ -358,13 +622,9 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 			})
 		}
 
-		log.Printf("Making follow-up request with %d messages (iteration %d)", len(openaiMessages), iteration+1)
-		// Update request body for next iteration
 		reqBody.Messages = openaiMessages
 	}
 
-	// If we exit the loop without getting a final response
-	log.Printf("Maximum iterations reached - Total input tokens: %d, Total output tokens: %d", totalInputTokens, totalOutputTokens)
 	return "I apologize, but I encountered an issue processing your request after multiple attempts.", nil
 }
 
@@ -375,7 +635,6 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 		return nil, fmt.Errorf("error marshaling request: %w", err)
 	}
 
-	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -384,14 +643,12 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+openaiAPIKey)
 
-	// Make request
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("error making request to OpenAI: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response: %w", err)
@@ -401,7 +658,6 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse response
 	var openaiResp OpenAIResponse
 	err = json.Unmarshal(body, &openaiResp)
 	if err != nil {
@@ -419,7 +675,7 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 func extractCookieValue(headers map[string]string, cookieName string) string {
 	cookieHeader, exists := headers["cookie"]
 	if !exists {
-		cookieHeader = headers["Cookie"] // Try capitalized version
+		cookieHeader = headers["Cookie"]
 	}
 
 	if cookieHeader == "" {
@@ -484,7 +740,78 @@ func handleChatPage(ctx context.Context, event events.LambdaFunctionURLRequest) 
 	}, nil
 }
 
-// handleSendMessage processes a chat message
+// handleSendMessageStreaming processes a chat message with streaming response
+func handleSendMessageStreaming(ctx context.Context, event events.LambdaFunctionURLRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
+	sessionID := extractCookieValue(event.Headers, "session_id")
+
+	session, err := getOrCreateSession(ctx, sessionID)
+	if err != nil {
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: 500,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+		}, nil
+	}
+
+	// Get message from query parameters
+	message := strings.TrimSpace(event.QueryStringParameters["message"])
+	if message == "" {
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: 400,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+		}, nil
+	}
+
+	// Add user message to session
+	userMsg := Message{
+		Content:   message,
+		IsUser:    true,
+		Timestamp: time.Now(),
+	}
+	session.Messages = append(session.Messages, userMsg)
+
+	// Create response with SSE headers
+	headers := map[string]string{
+		"Content-Type":                "text/event-stream",
+		"Cache-Control":               "no-cache",
+		"Connection":                  "keep-alive",
+		"Access-Control-Allow-Origin": "*",
+	}
+
+	// Set cookie if it's a new session
+	if sessionID != session.SessionID {
+		headers["Set-Cookie"] = fmt.Sprintf("session_id=%s; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict", session.SessionID)
+	}
+
+	// Create pipe for streaming
+	reader, writer := io.Pipe()
+
+	// Start streaming in a goroutine
+	go func() {
+		defer writer.Close()
+
+		// Stream the OpenAI response
+		err := streamOpenAIResponse(ctx, session.Messages, writer, session)
+		if err != nil {
+			log.Printf("Error streaming OpenAI response: %v", err)
+			errorData := StreamData{Error: err.Error()}
+			jsonData, _ := json.Marshal(errorData)
+			fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+		}
+
+		// Send completion signal
+		doneData := StreamData{Done: true}
+		jsonData, _ := json.Marshal(doneData)
+		fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+	}()
+
+	return &events.LambdaFunctionURLStreamingResponse{
+		StatusCode: 200,
+		Headers:    headers,
+		Body:       reader,
+	}, nil
+}
+
+// handleSendMessage processes a chat message (non-streaming fallback)
 func handleSendMessage(ctx context.Context, event events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	sessionID := extractCookieValue(event.Headers, "session_id")
 
@@ -501,7 +828,6 @@ func handleSendMessage(ctx context.Context, event events.LambdaFunctionURLReques
 	if event.IsBase64Encoded {
 		decodedBody, err := base64.StdEncoding.DecodeString(body)
 		if err != nil {
-			log.Printf("Error decoding base64 body: %v", err)
 			return events.LambdaFunctionURLResponse{
 				StatusCode: 400,
 				Body:       "Error decoding request body",
@@ -512,7 +838,6 @@ func handleSendMessage(ctx context.Context, event events.LambdaFunctionURLReques
 
 	values, err := url.ParseQuery(body)
 	if err != nil {
-		log.Printf("Error parsing form data: %v", err)
 		return events.LambdaFunctionURLResponse{
 			StatusCode: 400,
 			Body:       "Invalid form data",
@@ -535,7 +860,7 @@ func handleSendMessage(ctx context.Context, event events.LambdaFunctionURLReques
 	}
 	session.Messages = append(session.Messages, userMsg)
 
-	// Get bot response from OpenAI (with function calling support)
+	// Get bot response from OpenAI (non-streaming)
 	botResponse, err := callOpenAI(ctx, session.Messages)
 	if err != nil {
 		log.Printf("Error calling OpenAI: %v", err)
@@ -599,6 +924,7 @@ func handleStatus(ctx context.Context, event events.LambdaFunctionURLRequest) (e
 		"status":    "ok",
 		"service":   "chatgpt-chat-lambda",
 		"functions": functionList,
+		"streaming": true,
 	}
 
 	body, _ := json.Marshal(status)
@@ -610,8 +936,8 @@ func handleStatus(ctx context.Context, event events.LambdaFunctionURLRequest) (e
 	}, nil
 }
 
-// handler is the main Lambda handler
-func handler(ctx context.Context, event events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
+// handleRequest routes requests to appropriate handlers
+func handleRequest(ctx context.Context, event events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	log.Printf("Request: %s %s", event.RequestContext.HTTP.Method, event.RawPath)
 
 	switch {
@@ -631,6 +957,92 @@ func handler(ctx context.Context, event events.LambdaFunctionURLRequest) (events
 	}
 }
 
+// Update your main handler to properly route streaming vs non-streaming
+func handleStreamingRequest(ctx context.Context, event events.LambdaFunctionURLRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
+	log.Printf("Streaming Request: %s %s", event.RequestContext.HTTP.Method, event.RawPath)
+
+	switch {
+	case event.RequestContext.HTTP.Method == "GET" && event.RawPath == "/send-stream":
+		return handleSendMessageStreaming(ctx, event)
+	case event.RequestContext.HTTP.Method == "GET" && (event.RawPath == "/" || event.RawPath == ""):
+		// Convert regular response to streaming response for the main page
+		regularResponse, err := handleChatPage(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/send":
+		// Convert regular response to streaming response for non-streaming messages
+		regularResponse, err := handleSendMessage(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/clear":
+		// Convert regular response to streaming response for clear session
+		regularResponse, err := handleClearSession(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	case event.RequestContext.HTTP.Method == "GET" && event.RawPath == "/status":
+		// Convert regular response to streaming response for status
+		regularResponse, err := handleStatus(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	default:
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: 404,
+			Headers:    map[string]string{"Content-Type": "text/plain"},
+			Body:       strings.NewReader("Not Found"),
+		}, nil
+	}
+}
+
 func main() {
-	lambda.Start(handler)
+
+	// Start with regular handler that supports streaming
+	lambda.Start(handleStreamingRequest)
 }

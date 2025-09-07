@@ -102,6 +102,7 @@
             display: flex;
             gap: 10px;
             align-self: flex-end;
+            align-items: center;
         }
         #sendButton {
             padding: 10px 20px;
@@ -111,6 +112,7 @@
             border-radius: 4px;
             cursor: pointer;
             font-size: 16px;
+            min-width: 120px;
         }
         #sendButton:hover {
             background-color: #0056b3;
@@ -118,6 +120,16 @@
         #sendButton:disabled {
             background-color: #6c757d;
             cursor: not-allowed;
+        }
+        .streaming-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #666;
+        }
+        .streaming-toggle input[type="checkbox"] {
+            margin: 0;
         }
         .empty-chat {
             text-align: center;
@@ -133,6 +145,42 @@
             font-size: 0.9em;
             color: #666;
             text-align: center;
+        }
+
+        /* Streaming indicator */
+        .typing-indicator {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            color: #666;
+            font-style: italic;
+            margin-bottom: 10px;
+        }
+        .typing-indicator.active {
+            display: flex;
+        }
+        .typing-dots {
+            display: flex;
+            gap: 3px;
+        }
+        .typing-dots span {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: #666;
+            animation: typing 1.4s infinite ease-in-out;
+        }
+        .typing-dots span:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dots span:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes typing {
+            0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+
+        /* Streaming message style */
+        .streaming-message {
+            border-left: 3px solid #007bff;
+            background-color: #f8f9fa !important;
         }
 
         /* Markdown styling for bot messages */
@@ -315,11 +363,25 @@
                     👋 Welcome! Start a conversation by typing a message below.
                 </div>
             {{end}}
+            
+            <!-- Typing indicator for streaming -->
+            <div class="typing-indicator" id="typingIndicator">
+                <span>Assistant is typing</span>
+                <div class="typing-dots">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            </div>
         </div>
         
-        <form class="input-form" method="POST" action="/send">
+        <form class="input-form" id="messageForm">
             <textarea id="messageInput" name="message" placeholder="Type your message here..." required></textarea>
             <div class="button-group">
+                <div class="streaming-toggle">
+                    <input type="checkbox" id="streamingEnabled" checked>
+                    <label for="streamingEnabled">Real-time streaming</label>
+                </div>
                 <button type="submit" id="sendButton">Send Message</button>
             </div>
             <div class="input-hint">Press Enter to send • Shift+Enter for new line</div>
@@ -327,6 +389,11 @@
     </div>
 
     <script>
+        // Global variables
+        let currentEventSource = null;
+        let currentStreamingMessage = null;
+        let streamingContent = '';
+
         // Configure marked options
         marked.setOptions({
             breaks: true,
@@ -421,11 +488,204 @@
             const chatMessages = document.getElementById('chatMessages');
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
-        
-        window.addEventListener('load', function() {
-            processMarkdown();
+
+        function addUserMessage(message) {
+            const chatMessages = document.getElementById('chatMessages');
+            const emptyChat = chatMessages.querySelector('.empty-chat');
+            if (emptyChat) {
+                emptyChat.remove();
+            }
+
+            const messageEl = document.createElement('div');
+            messageEl.className = 'message user-message';
+            messageEl.innerHTML = `
+                <div class="message-content">${escapeHtml(message)}</div>
+                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+            `;
+            
+            chatMessages.appendChild(messageEl);
             scrollToBottom();
+        }
+
+        function createStreamingBotMessage() {
+            const chatMessages = document.getElementById('chatMessages');
+            
+            const messageEl = document.createElement('div');
+            messageEl.className = 'message bot-message streaming-message';
+            messageEl.innerHTML = `
+                <div class="message-content"></div>
+                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+            `;
+            
+            chatMessages.appendChild(messageEl);
+            scrollToBottom();
+            return messageEl;
+        }
+
+        function updateStreamingMessage(messageEl, content) {
+            const contentEl = messageEl.querySelector('.message-content');
+            
+            // Update the content and re-process markdown
+            messageEl.dataset.content = content;
+            contentEl.dataset.processed = 'false';
+            
+            try {
+                const htmlContent = marked.parse(content);
+                contentEl.innerHTML = htmlContent;
+                
+                // Trigger Prism highlighting
+                if (window.Prism) {
+                    Prism.highlightAllUnder(contentEl);
+                }
+            } catch (e) {
+                contentEl.textContent = content;
+            }
+            
+            // Add copy buttons to any new code blocks
+            addCopyButtonToCodeBlocks();
+            scrollToBottom();
+        }
+
+        function finalizeStreamingMessage(messageEl) {
+            messageEl.classList.remove('streaming-message');
+            messageEl.querySelector('.message-content').dataset.processed = 'true';
+        }
+
+        function showTypingIndicator() {
+            document.getElementById('typingIndicator').classList.add('active');
+            scrollToBottom();
+        }
+
+        function hideTypingIndicator() {
+            document.getElementById('typingIndicator').classList.remove('active');
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function sendMessage(message, useStreaming = true) {
+            const sendButton = document.getElementById('sendButton');
+            const messageInput = document.getElementById('messageInput');
+            
+            // Add user message to chat
+            addUserMessage(message);
+            
+            // Clear input and disable form
+            messageInput.value = '';
+            sendButton.disabled = true;
+            sendButton.textContent = 'Sending...';
+            
+            if (useStreaming) {
+                sendStreamingMessage(message);
+            } else {
+                sendNonStreamingMessage(message);
+            }
+        }
+
+        function sendStreamingMessage(message) {
+            showTypingIndicator();
+            
+            // Create streaming message container
+            currentStreamingMessage = createStreamingBotMessage();
+            streamingContent = '';
+            
+            // Create EventSource for streaming
+            const encodedMessage = encodeURIComponent(message);
+            currentEventSource = new EventSource(`/send-stream?message=${encodedMessage}`);
+            
+            currentEventSource.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.error) {
+                        hideTypingIndicator();
+                        streamingContent = `Error: ${data.error}`;
+                        updateStreamingMessage(currentStreamingMessage, streamingContent);
+                        finalizeStreamingMessage(currentStreamingMessage);
+                        resetForm();
+                        currentEventSource.close();
+                    } else if (data.done) {
+                        hideTypingIndicator();
+                        finalizeStreamingMessage(currentStreamingMessage);
+                        resetForm();
+                        currentEventSource.close();
+                        
+                        // Refresh page to get updated session
+                        setTimeout(() => window.location.reload(), 100);
+                    } else if (data.content) {
+                        hideTypingIndicator();
+                        streamingContent += data.content;
+                        updateStreamingMessage(currentStreamingMessage, streamingContent);
+                    }
+                } catch (e) {
+                    console.error('Error parsing streaming data:', e);
+                }
+            };
+            
+            currentEventSource.onerror = function() {
+                hideTypingIndicator();
+                if (currentStreamingMessage) {
+                    streamingContent += '\n\n[Connection error occurred]';
+                    updateStreamingMessage(currentStreamingMessage, streamingContent);
+                    finalizeStreamingMessage(currentStreamingMessage);
+                }
+                resetForm();
+                currentEventSource.close();
+            };
+        }
+
+        function sendNonStreamingMessage(message) {
+            // Use traditional form submission for non-streaming
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/send';
+            
+            const messageField = document.createElement('input');
+            messageField.type = 'hidden';
+            messageField.name = 'message';
+            messageField.value = message;
+            
+            form.appendChild(messageField);
+            document.body.appendChild(form);
+            form.submit();
+        }
+
+        function resetForm() {
+            const sendButton = document.getElementById('sendButton');
+            sendButton.disabled = false;
+            sendButton.textContent = 'Send Message';
             document.getElementById('messageInput').focus();
+        }
+
+        function stopStreaming() {
+            if (currentEventSource) {
+                currentEventSource.close();
+                currentEventSource = null;
+            }
+            hideTypingIndicator();
+            if (currentStreamingMessage) {
+                finalizeStreamingMessage(currentStreamingMessage);
+            }
+            resetForm();
+        }
+
+        // Event listeners
+        document.getElementById('messageForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const messageInput = document.getElementById('messageInput');
+            const message = messageInput.value.trim();
+            const useStreaming = document.getElementById('streamingEnabled').checked;
+            
+            if (!message) return;
+            
+            // Stop any ongoing streaming
+            stopStreaming();
+            
+            sendMessage(message, useStreaming);
         });
 
         // Modified keyboard handling: Enter to send, Shift+Enter for new line
@@ -437,9 +697,20 @@
                 } else {
                     // Enter alone: prevent default and submit form
                     e.preventDefault();
-                    document.querySelector('.input-form').submit();
+                    document.getElementById('messageForm').dispatchEvent(new Event('submit'));
                 }
             }
+        });
+
+        // Stop streaming on page unload
+        window.addEventListener('beforeunload', function() {
+            stopStreaming();
+        });
+        
+        window.addEventListener('load', function() {
+            processMarkdown();
+            scrollToBottom();
+            document.getElementById('messageInput').focus();
         });
     </script>
 </body>
