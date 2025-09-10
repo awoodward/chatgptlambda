@@ -943,8 +943,14 @@ func handleRequest(ctx context.Context, event events.LambdaFunctionURLRequest) (
 	switch {
 	case event.RequestContext.HTTP.Method == "GET" && (event.RawPath == "/" || event.RawPath == ""):
 		return handleChatPage(ctx, event)
+	case event.RequestContext.HTTP.Method == "GET" && strings.HasPrefix(event.RawPath, "/session/"):
+		return handleViewSession(ctx, event)
+	//case event.RequestContext.HTTP.Method == "GET" && event.RawPath == "/sessions":
+	//	return handleListSessions(ctx, event)
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/send":
 		return handleSendMessage(ctx, event)
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/save":
+		return handleSaveSession(ctx, event)
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/batch":
 		return handleBatchProcess(ctx, event)
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/clear":
@@ -985,9 +991,62 @@ func handleStreamingRequest(ctx context.Context, event events.LambdaFunctionURLR
 			Headers:    regularResponse.Headers,
 			Body:       reader,
 		}, nil
+	case event.RequestContext.HTTP.Method == "GET" && strings.HasPrefix(event.RawPath, "/session/"):
+		// Convert regular response to streaming response for session view
+		regularResponse, err := handleViewSession(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	/*
+		case event.RequestContext.HTTP.Method == "GET" && event.RawPath == "/sessions":
+			// Convert regular response to streaming response for sessions list
+			regularResponse, err := handleListSessions(ctx, event)
+			if err != nil {
+				return &events.LambdaFunctionURLStreamingResponse{
+					StatusCode: 500,
+					Headers:    map[string]string{"Content-Type": "text/plain"},
+				}, err
+			}
+
+			// Convert to streaming response
+			reader := strings.NewReader(regularResponse.Body)
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: regularResponse.StatusCode,
+				Headers:    regularResponse.Headers,
+				Body:       reader,
+			}, nil
+	*/
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/send":
 		// Convert regular response to streaming response for non-streaming messages
 		regularResponse, err := handleSendMessage(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/save":
+		// Convert regular response to streaming response for save session
+		regularResponse, err := handleSaveSession(ctx, event)
 		if err != nil {
 			return &events.LambdaFunctionURLStreamingResponse{
 				StatusCode: 500,
