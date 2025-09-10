@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -110,11 +111,13 @@ type StreamData struct {
 }
 
 var (
-	dynamoClient     *dynamodb.Client
-	tableName        string
-	openaiAPIKey     string
-	httpClient       *http.Client
-	functionRegistry *FunctionRegistry
+	dynamoClient         *dynamodb.Client
+	tableName            string
+	openaiAPIKey         string
+	openaiAPIBaseURL     string
+	httpClient           *http.Client
+	functionRegistry     *FunctionRegistry
+	truncateMessageCount int
 )
 
 func init() {
@@ -124,10 +127,30 @@ func init() {
 		tableName = "bedrock-chat-sessions" // Default table name
 	}
 
+	// Changes for Google Gemini:
+	// https://ai.google.dev/gemini-api/docs/openai
 	// Get OpenAI API key from environment variable
 	openaiAPIKey = os.Getenv("OPENAI_API_KEY")
 	if openaiAPIKey == "" {
 		log.Fatal("OPENAI_API_KEY environment variable not set")
+	}
+
+	//"https://api.openai.com/v1/chat/completions"
+	// Get OpenAI Base URL from environment variable
+	openaiAPIBaseURL = os.Getenv("API_BASE_URL")
+	if openaiAPIBaseURL == "" {
+		openaiAPIBaseURL = "https://api.openai.com/v1/chat/completions" // Default OpenAI API base URL
+	}
+
+	// Default to not truncating messages
+	truncateMessageCountStr := os.Getenv("TRUNCATE_MESSAGE_COUNT")
+	if truncateMessageCountStr == "" {
+		truncateMessageCountStr = "0" // Default to 20 messages
+	}
+	var err error
+	truncateMessageCount, err = strconv.Atoi(truncateMessageCountStr)
+	if err != nil {
+		truncateMessageCount = 0
 	}
 
 	// Initialize AWS clients
@@ -247,9 +270,23 @@ func getOrCreateSession(ctx context.Context, sessionID string) (*ChatSession, er
 	return session, nil
 }
 
+func truncateConversationIfNeeded(messages []Message) []Message {
+	if truncateMessageCount == 0 {
+		return messages
+	}
+	maxMessages := truncateMessageCount // Keep last truncateMessageCount messages
+	if len(messages) > maxMessages {
+		return messages[len(messages)-maxMessages:]
+	}
+	return messages
+}
+
 // Fixed streamOpenAIResponse function with proper tool call handling
 func streamOpenAIResponse(ctx context.Context, messages []Message, writer io.Writer, session *ChatSession) error {
 	log.Println("Starting streaming OpenAI API call...")
+
+	// Truncate conversation if it's getting too long
+	messages = truncateConversationIfNeeded(messages)
 
 	// Convert our messages to OpenAI format
 	openaiMessages := make([]OpenAIMessage, 0)
@@ -463,7 +500,25 @@ func streamRegularResponse(ctx context.Context, openaiMessages []OpenAIMessage, 
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
+		log.Printf("OpenAI API error - Status: %d, Body: %s", resp.StatusCode, string(body))
+
+		var userMessage string
+		switch resp.StatusCode {
+		case 429:
+			userMessage = "This conversation is too long or complex for me to process. Please start a new chat or try simplifying your request"
+		case 400:
+			userMessage = "I encountered an issue with your request. Please try rephrasing your message"
+		case 401:
+			userMessage = "I'm having authentication issues. Please contact support"
+		case 403:
+			userMessage = "I don't have permission to process this request"
+		case 500, 502, 503, 504:
+			userMessage = "The AI service is temporarily experiencing issues. Please try again shortly"
+		default:
+			userMessage = "I encountered an unexpected error. Please try again"
+		}
+
+		return fmt.Errorf(userMessage)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -522,6 +577,10 @@ func streamRegularResponse(ctx context.Context, openaiMessages []OpenAIMessage, 
 // callOpenAI sends a message to OpenAI ChatGPT API (non-streaming fallback)
 func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 	log.Println("Calling OpenAI API (non-streaming)...")
+
+	// Truncate conversation if it's getting too long
+	messages = truncateConversationIfNeeded(messages)
+
 	// Convert our messages to OpenAI format
 	openaiMessages := make([]OpenAIMessage, 0)
 
@@ -654,8 +713,26 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 		return nil, fmt.Errorf("error reading response: %w", err)
 	}
 
+	// Handle different HTTP status codes with user-friendly messages
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
+		log.Printf("OpenAI API error - Status: %d, Body: %s", resp.StatusCode, string(body))
+
+		switch resp.StatusCode {
+		case 429: // Rate limit exceeded
+			return nil, fmt.Errorf("I'm currently experiencing high usage and need to slow down. Please try again in a few moments")
+		case 400: // Bad request
+			return nil, fmt.Errorf("I encountered an issue with your request. Please try rephrasing your message")
+		case 401: // Unauthorized
+			return nil, fmt.Errorf("I'm having authentication issues. Please contact support")
+		case 403: // Forbidden
+			return nil, fmt.Errorf("I don't have permission to process this request")
+		case 404: // Not found
+			return nil, fmt.Errorf("The AI service is temporarily unavailable")
+		case 500, 502, 503, 504: // Server errors
+			return nil, fmt.Errorf("The AI service is temporarily experiencing issues. Please try again shortly")
+		default:
+			return nil, fmt.Errorf("I encountered an unexpected error. Please try again")
+		}
 	}
 
 	var openaiResp OpenAIResponse
@@ -665,7 +742,18 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 	}
 
 	if openaiResp.Error != nil {
-		return nil, fmt.Errorf("OpenAI API error: %s", openaiResp.Error.Message)
+		log.Printf("OpenAI API error response: %+v", openaiResp.Error)
+		// Provide user-friendly messages for specific error types
+		switch openaiResp.Error.Type {
+		case "tokens":
+			return nil, fmt.Errorf("Your conversation has become too long. Please start a new chat session to continue")
+		case "rate_limit_exceeded":
+			return nil, fmt.Errorf("I'm currently experiencing high usage. Please try again in a few moments")
+		case "invalid_request_error":
+			return nil, fmt.Errorf("I encountered an issue with your request. Please try rephrasing your message")
+		default:
+			return nil, fmt.Errorf("I encountered an error: %s", openaiResp.Error.Message)
+		}
 	}
 
 	return &openaiResp, nil
@@ -707,6 +795,7 @@ func handleChatPage(ctx context.Context, event events.LambdaFunctionURLRequest) 
 	// Parse and execute template
 	tmpl, err := template.ParseFiles("templates/chat.html")
 	if err != nil {
+		log.Printf("Template parsing error: %v", err)
 		return events.LambdaFunctionURLResponse{
 			StatusCode: 500,
 			Body:       "Template error",
@@ -718,6 +807,7 @@ func handleChatPage(ctx context.Context, event events.LambdaFunctionURLRequest) 
 	var buf strings.Builder
 	err = tmpl.Execute(&buf, data)
 	if err != nil {
+		log.Printf("Template execution error: %v", err)
 		return events.LambdaFunctionURLResponse{
 			StatusCode: 500,
 			Body:       "Template execution error",
