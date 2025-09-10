@@ -945,8 +945,12 @@ func handleRequest(ctx context.Context, event events.LambdaFunctionURLRequest) (
 		return handleChatPage(ctx, event)
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/send":
 		return handleSendMessage(ctx, event)
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/batch":
+		return handleBatchProcess(ctx, event)
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/clear":
 		return handleClearSession(ctx, event)
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/chat":
+		return handleSingleChat(ctx, event)
 	case event.RequestContext.HTTP.Method == "GET" && event.RawPath == "/status":
 		return handleStatus(ctx, event)
 	default:
@@ -998,9 +1002,43 @@ func handleStreamingRequest(ctx context.Context, event events.LambdaFunctionURLR
 			Headers:    regularResponse.Headers,
 			Body:       reader,
 		}, nil
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/batch":
+		// Convert regular response to streaming response for batch processing
+		regularResponse, err := handleBatchProcess(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
 	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/clear":
 		// Convert regular response to streaming response for clear session
 		regularResponse, err := handleClearSession(ctx, event)
+		if err != nil {
+			return &events.LambdaFunctionURLStreamingResponse{
+				StatusCode: 500,
+				Headers:    map[string]string{"Content-Type": "text/plain"},
+			}, err
+		}
+
+		// Convert to streaming response
+		reader := strings.NewReader(regularResponse.Body)
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: regularResponse.StatusCode,
+			Headers:    regularResponse.Headers,
+			Body:       reader,
+		}, nil
+	case event.RequestContext.HTTP.Method == "POST" && event.RawPath == "/chat":
+		// Convert regular response to streaming response for chat
+		regularResponse, err := handleSingleChat(ctx, event)
 		if err != nil {
 			return &events.LambdaFunctionURLStreamingResponse{
 				StatusCode: 500,
