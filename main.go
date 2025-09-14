@@ -483,7 +483,7 @@ func streamRegularResponse(ctx context.Context, openaiMessages []OpenAIMessage, 
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", openaiAPIBaseURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
@@ -694,7 +694,7 @@ func makeOpenAIRequest(ctx context.Context, reqBody OpenAIRequest) (*OpenAIRespo
 		return nil, fmt.Errorf("error marshaling request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", openaiAPIBaseURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
