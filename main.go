@@ -390,12 +390,33 @@ func streamNonStreamingResponse(ctx context.Context, openaiMessages []OpenAIMess
 			if choice.Message.Content != "" {
 				totalResponse += choice.Message.Content
 				// Send it as chunks to simulate streaming
-				words := strings.Fields(choice.Message.Content)
-				for _, word := range words {
-					streamData := StreamData{Content: word + " "}
-					jsonData, _ := json.Marshal(streamData)
-					fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
-					time.Sleep(50 * time.Millisecond) // Small delay to simulate streaming
+				/*
+					words := strings.Fields(choice.Message.Content)
+					for _, word := range words {
+						streamData := StreamData{Content: word + " "}
+						jsonData, _ := json.Marshal(streamData)
+						fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+						time.Sleep(50 * time.Millisecond) // Small delay to simulate streaming
+					}
+				*/
+				if choice.Message.Content != "" {
+					totalResponse += choice.Message.Content
+					// Send it as chunks to preserve formatting
+					contentBytes := []byte(choice.Message.Content)
+					chunkSize := 50 // adjust as needed
+
+					for i := 0; i < len(contentBytes); i += chunkSize {
+						end := i + chunkSize
+						if end > len(contentBytes) {
+							end = len(contentBytes)
+						}
+
+						chunk := string(contentBytes[i:end])
+						streamData := StreamData{Content: chunk}
+						jsonData, _ := json.Marshal(streamData)
+						fmt.Fprintf(writer, "data: %s\n\n", string(jsonData))
+						time.Sleep(50 * time.Millisecond)
+					}
 				}
 			}
 
@@ -444,9 +465,10 @@ func streamNonStreamingResponse(ctx context.Context, openaiMessages []OpenAIMess
 			// Add function result message
 			openaiMessages = append(openaiMessages, OpenAIMessage{
 				Role:       "tool",
-				Content:    result,
+				Content:    string(result),
 				ToolCallID: toolCall.ID,
 			})
+			log.Printf("Tool Call Message (streamNonStreamingResponse):\n%v", openaiMessages[len(openaiMessages)-1])
 		}
 
 		// Update request for next iteration
@@ -676,9 +698,10 @@ func callOpenAI(ctx context.Context, messages []Message) (string, error) {
 
 			openaiMessages = append(openaiMessages, OpenAIMessage{
 				Role:       "tool",
-				Content:    result,
+				Content:    string(result),
 				ToolCallID: toolCall.ID,
 			})
+			log.Printf("Tool Call Message: (callOpenAI) \n%v", openaiMessages[len(openaiMessages)-1])
 		}
 
 		reqBody.Messages = openaiMessages
